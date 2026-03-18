@@ -2,7 +2,7 @@ const API_BASE = import.meta.env.VITE_API_URL || "";
 
 // ── Code Execution ──
 export async function executeCode({ code, language, stdin }) {
-  const res = await fetch(`${API_BASE}/api/execute`, {
+  const res = await fetch(`${API_BASE}/api/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code, language, stdin }),

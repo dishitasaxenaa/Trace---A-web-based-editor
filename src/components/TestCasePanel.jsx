@@ -12,10 +12,12 @@ const PANEL_W = 268;
 const TestCasePanel = ({ open, actualOutput, input, setInput }) => {
   const [expected, setExpected] = useState("[0, 1]");
 
-  const actual       = actualOutput ?? "";
+  const actual = actualOutput?.output || "";
+  const error = actualOutput?.error || "";
   const hasRun       = actualOutput !== null;
-  const passed       = hasRun && actual.trim() === expected.trim();
-  const failed       = hasRun && actual.trim() !== expected.trim();
+  const hasError = !!error;
+  const passed = hasRun && !hasError && actual.trim() === expected.trim();
+  const failed = hasRun && (hasError || actual.trim() !== expected.trim());
   const statusColor  = passed ? T.green : failed ? T.red : T.textMut;
   const statusBg     = passed ? T.greenDim : failed ? T.redDim : T.elevated;
   const statusBorder = passed ? T.green + "55" : failed ? T.red + "55" : T.border;
@@ -29,7 +31,7 @@ const TestCasePanel = ({ open, actualOutput, input, setInput }) => {
     fontSize: 12, lineHeight: 1.6, resize: "none", outline: "none",
     transition: "border-color 0.15s, background 0.15s",
   };
-
+  console.log("PANEL RECEIVED:", actualOutput);
   const verdictArea = hasRun ? {
     background: passed ? T.greenDim : T.redDim,
     border: `1px solid ${passed ? T.green + "66" : T.red + "66"}`,
@@ -93,9 +95,11 @@ const TestCasePanel = ({ open, actualOutput, input, setInput }) => {
           <div>
             <SectionLabel>Actual Output</SectionLabel>
             <div style={{ ...baseArea, ...verdictArea, minHeight: 48, cursor: "default" }}>
-              {actual
-                ? <pre style={{ margin: 0, fontFamily: T.font, fontSize: 12, color: passed ? T.green : failed ? T.red : T.textPri, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{actual}</pre>
-                : <span style={{ color: T.textMut, fontSize: 12 }}>Run code to see output</span>
+              {hasError
+                ? <pre style={{ color: T.red }}>{error}</pre>
+                : actual
+                  ? <pre style={{ color: passed ? T.green : T.textPri }}>{actual}</pre>
+                  : <span style={{ color: T.textMut }}>Run code to see output</span>
               }
             </div>
           </div>

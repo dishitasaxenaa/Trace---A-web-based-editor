@@ -24,17 +24,25 @@ const Layout = () => {
     setTestActual(null);
 
     try {
+      const langMap = {
+        "Python": "python",
+        "C++": "cpp"
+      };
+      
       const result = await executeCode({
         code,
-        language,
+        language: langMap[language], 
         stdin: testOpen ? testInput : "",
       });
 
       if (testOpen) {
-        setTestActual(result.stdout.trim());
+        setTestActual(result);
+        console.log("TEST ACTUAL STATE:", result);
       } else {
         setOutput(result);
       }
+      console.log("RESULT FROM BACKEND:", result);
+    
     } catch (err) {
       const errorResult = {
         stdout: "",
@@ -43,12 +51,13 @@ const Layout = () => {
         memory: "0.0 MB",
         status: "Error",
       };
+    
       if (testOpen) {
         setTestActual(`Error: ${err.message}`);
       } else {
         setOutput(errorResult);
       }
-    } finally {
+    }finally {
       setRunning(false);
     }
   }, [code, language, testOpen, testInput]);
