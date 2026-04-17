@@ -1,115 +1,67 @@
 /**
  * codeGuard.js
- * Static pattern analysis — rejects obviously dangerous code before
- * it ever touches the filesystem.
- *
- * This is NOT a full sandbox. For production, use Docker or gVisor.
- * This layer is a cheap first filter that stops the most common abuse.
- *
- * Usage:
- *   const result = isSafe(code, "python");
- *   // result → { safe: true, reason: null }
- *   // result → { safe: false, reason: "Shell access is not allowed" }
+ * Fast static pre-filter before Docker even runs.
+ * Docker isolation is the real sandbox — this is just a cheap first pass.
  */
 
-// ── Rule sets per language ────────────────────────────────────────────────────
-
 const PYTHON_RULES = [
-  {
-    // subprocess, os.system, os.popen — shell execution
-    pattern: /\b(subprocess|os\.system|os\.popen|commands)\b/,
-    reason:  "Shell/subprocess access is not allowed",
-  },
-  {
-    // exec() and eval() allow arbitrary code execution
-    pattern: /\b(exec|eval)\s*\(/,
-    reason:  "exec() and eval() are not allowed",
-  },
-  {
-    // compile() can also be used to run dynamic code
-    pattern: /\bcompile\s*\(/,
-    reason:  "compile() is not allowed",
-  },
-  {
-    // __import__ is an alternate way to import modules dynamically
-    pattern: /__import__\s*\(/,
-    reason:  "Dynamic imports via __import__ are not allowed",
-  },
-  {
-    // open() in write/append mode — prevent file system writes
-    pattern: /\bopen\s*\(.*?['"](w|a|wb|ab|w\+|a\+)['"]/,
-    reason:  "Writing to files is not allowed",
-  },
-  {
-    // Network access
-    pattern: /\b(socket|urllib|requests|httpx|aiohttp|pycurl)\b/,
-    reason:  "Network access is not allowed",
-  },
-  {
-    // shutil — file system manipulation (copy, move, delete)
-    pattern: /\bshutil\b/,
-    reason:  "File system manipulation (shutil) is not allowed",
-  },
-  {
-    // ctypes — can call native libraries and system functions
-    pattern: /\bctypes\b/,
-    reason:  "ctypes is not allowed",
-  },
+  { pattern: /\b(subprocess|os\.system|os\.popen|commands)\b/, reason: "Shell/subprocess access is not allowed" },
+  { pattern: /\b(exec|eval)\s*\(/, reason: "exec() and eval() are not allowed" },
+  { pattern: /\bcompile\s*\(/, reason: "compile() is not allowed" },
+  { pattern: /__import__\s*\(/, reason: "Dynamic imports via __import__ are not allowed" },
+  { pattern: /\bopen\s*\(.*?['"](w|a|wb|ab|w\+|a\+)['"]/, reason: "Writing to files is not allowed" },
+  { pattern: /\b(socket|urllib|requests|httpx|aiohttp|pycurl)\b/, reason: "Network access is not allowed" },
+  { pattern: /\bshutil\b/, reason: "File system manipulation (shutil) is not allowed" },
+  { pattern: /\bctypes\b/, reason: "ctypes is not allowed" },
 ];
 
 const CPP_RULES = [
-  {
-    // system() — runs shell commands
-    pattern: /\bsystem\s*\(/,
-    reason:  "system() calls are not allowed",
-  },
-  {
-    // popen — runs shell commands and reads output
-    pattern: /\bpopen\s*\(/,
-    reason:  "popen() is not allowed",
-  },
-  {
-    // exec family — replaces current process image with another program
-    pattern: /\b(execl|execv|execvp|execlp|execle|execve)\s*\(/,
-    reason:  "exec() family calls are not allowed",
-  },
-  {
-    // fork — create child processes
-    pattern: /\bfork\s*\(\s*\)/,
-    reason:  "fork() is not allowed",
-  },
-  {
-    // socket — network access
-    pattern: /\bsocket\s*\(/,
-    reason:  "Network socket access is not allowed",
-  },
-  {
-    // fopen in write/append mode
-    pattern: /\bfopen\s*\(.*?['"](w|a|wb|ab)['"]/,
-    reason:  "Writing to files is not allowed",
-  },
-  {
-    // Including network or system-level headers
-    pattern: /#include\s*[<"](sys\/socket|netinet\/|arpa\/inet|unistd\.h)[>"]/,
-    reason:  "Network/system headers are not allowed",
-  },
+  { pattern: /\bsystem\s*\(/, reason: "system() calls are not allowed" },
+  { pattern: /\bpopen\s*\(/, reason: "popen() is not allowed" },
+  { pattern: /\b(execl|execv|execvp|execlp|execle|execve)\s*\(/, reason: "exec() family calls are not allowed" },
+  { pattern: /\bfork\s*\(\s*\)/, reason: "fork() is not allowed" },
+  { pattern: /\bsocket\s*\(/, reason: "Network socket access is not allowed" },
+  { pattern: /\bfopen\s*\(.*?['"](w|a|wb|ab)['"]/, reason: "Writing to files is not allowed" },
+  { pattern: /#include\s*[<"](sys\/socket|netinet\/|arpa\/inet|unistd\.h)[>"]/, reason: "Network/system headers are not allowed" },
 ];
 
-// ── Public API ────────────────────────────────────────────────────────────────
+const JS_RULES = [
+  { pattern: /\brequire\s*\(\s*['"]child_process['"]/, reason: "child_process module is not allowed" },
+  { pattern: /\brequire\s*\(\s*['"]fs['"]/, reason: "fs module is not allowed" },
+  { pattern: /\brequire\s*\(\s*['"]net['"]/, reason: "net module is not allowed" },
+  { pattern: /\bprocess\.exit\b/, reason: "process.exit() is not allowed" },
+];
 
-/**
- * isSafe
- * Checks code against the rule set for the given language.
- * Returns on the first matching (blocked) rule.
- *
- * @param {string} code
- * @param {"python"|"cpp"} language
- * @returns {{ safe: boolean, reason: string | null }}
- */
+const JAVA_RULES = [
+  { pattern: /Runtime\.getRuntime\(\)\.exec/, reason: "Runtime.exec() is not allowed" },
+  { pattern: /ProcessBuilder/, reason: "ProcessBuilder is not allowed" },
+  { pattern: /new\s+FileWriter|new\s+FileOutputStream/, reason: "Writing to files is not allowed" },
+  { pattern: /import\s+java\.net\./, reason: "Network access is not allowed" },
+];
+
+const GO_RULES = [
+  { pattern: /\bos\/exec\b/, reason: "os/exec package is not allowed" },
+  { pattern: /\bnet\b/, reason: "net package is not allowed" },
+  { pattern: /os\.WriteFile|os\.Create/, reason: "Writing to files is not allowed" },
+];
+
+const RUST_RULES = [
+  { pattern: /std::process::Command/, reason: "process::Command is not allowed" },
+  { pattern: /std::net::/, reason: "Network access is not allowed" },
+  { pattern: /std::fs::write|File::create/, reason: "Writing to files is not allowed" },
+];
+
+const RULES = {
+  python:     PYTHON_RULES,
+  cpp:        CPP_RULES,
+  javascript: JS_RULES,
+  java:       JAVA_RULES,
+  go:         GO_RULES,
+  rust:       RUST_RULES,
+};
+
 export function isSafe(code, language) {
-  const rules = language === "python" ? PYTHON_RULES
-              : language === "cpp"    ? CPP_RULES
-              : [];
+  const rules = RULES[language] || [];
 
   for (const rule of rules) {
     if (rule.pattern.test(code)) {
@@ -117,7 +69,6 @@ export function isSafe(code, language) {
     }
   }
 
-  // Reject unreasonably large payloads (50 KB is plenty for a snippet)
   if (code.length > 50_000) {
     return { safe: false, reason: "Code exceeds the 50 KB size limit" };
   }

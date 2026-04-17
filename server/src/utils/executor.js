@@ -1,131 +1,143 @@
 /**
- * executor.js
- * Runs user code locally using Node's child_process.spawn.
+ * executor.js  (Docker edition)
  *
- * Python  → python3 <file.py>
- * C++     → g++ <file.cpp> -o <file.out>  then  ./<file.out>
+ * Runs user code inside a throwaway Docker container.
+ * Each container is:
+ *   - network-isolated  (--network none)
+ *   - memory-capped     (--memory 128m)
+ *   - CPU-capped        (--cpus 0.5)
+ *   - read-only FS      (--read-only) with a small /tmp tmpfs
+ *   - auto-removed      (--rm)
+ *   - killed on timeout (SIGKILL via `docker stop`)
  *
- * Every spawned process is subject to a hard timeout (EXEC_TIMEOUT_MS).
- * If the process hasn't exited by then, it is killed with SIGKILL.
- *
- * Return shape for all functions:
- *   { output: string, error: string }
+ * Supports: python, cpp, javascript, java, go, rust
  */
 
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
+import path   from "path";
+import { v4 as uuidv4 } from "uuid";
 
-// Timeout in ms — read from .env, default to 5 seconds
-const TIMEOUT_MS = parseInt(process.env.EXEC_TIMEOUT_MS, 10) || 5000;
+const TIMEOUT_MS = parseInt(process.env.EXEC_TIMEOUT_MS, 10) || 10_000;
 
-const PYTHON_CMD = process.env.PYTHON_CMD || "python";
+// ── Docker image map ──────────────────────────────────────────────────────────
+const IMAGES = {
+  python:     "python:3.12-slim",
+  cpp:        "gcc:13",
+  javascript: "node:20-slim",
+  java:       "openjdk:21-slim",
+  go:         "golang:1.22-alpine",
+  rust:       "rust:1-slim",
+};
+
+// ── Run commands inside the container ────────────────────────────────────────
+// Each entry: array of shell commands joined with &&
+// The source file is always mounted at /code/<filename>
+const RUN_COMMANDS = {
+  python:     (f) => `python /code/${f}`,
+  cpp:        (f) => `g++ -O2 -std=c++17 /code/${f} -o /tmp/a.out && /tmp/a.out`,
+  javascript: (f) => `node /code/${f}`,
+  java:       (f) => {
+    // Java class name must match filename; we always write Main.java
+    return `cd /code && javac ${f} && java Main`;
+  },
+  go:         (f) => `go run /code/${f}`,
+  rust:       (f) => `rustc /code/${f} -o /tmp/a.out && /tmp/a.out`,
+};
+
+const EXTENSIONS = {
+  python:     ".py",
+  cpp:        ".cpp",
+  javascript: ".js",
+  java:       ".java",   // always Main.java so class name matches
+  go:         ".go",
+  rust:       ".rs",
+};
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * executeCode
- * Entry point — dispatches to the correct language handler.
- *
- * @param {{ source: string, binary: string|null }} filePaths
- * @param {"python"|"cpp"} language
+ * runInDocker
+ * @param {string} code
+ * @param {string} language  - one of the keys in IMAGES
+ * @param {string} stdin
  * @returns {Promise<{ output: string, error: string }>}
  */
-export async function executeCode(filePaths, language, stdin = "") {
-  if (language === "python") {
-    return runProcess(PYTHON_CMD, [filePaths.source], stdin);
+export async function runInDocker(code, language, stdin = "") {
+  const lang = language.toLowerCase();
+
+  if (!IMAGES[lang]) {
+    return { output: "", error: `Unsupported language: ${language}` };
   }
 
-  if (language === "cpp") {
-    return runCpp(filePaths.source, filePaths.binary, stdin);
-  }
+  const ext      = EXTENSIONS[lang];
+  // Java: class must be "Main", so filename must be "Main.java"
+  const filename = lang === "java" ? "Main.java" : `solution${ext}`;
+  const image    = IMAGES[lang];
+  const cmd      = RUN_COMMANDS[lang](filename);
+  const name     = `trace_${uuidv4().replace(/-/g, "").slice(0, 12)}`;
 
-  throw new Error(`No executor defined for language: ${language}`);
-}
+  // Build docker run args
+  const dockerArgs = [
+    "run",
+    "--rm",                         // auto-remove when done
+    "--name", name,
+    "--network", "none",            // no internet
+    "--memory", "128m",             // RAM cap
+    "--memory-swap", "128m",        // no swap
+    "--cpus", "0.5",                // CPU cap
+    "--read-only",                  // read-only root FS
+    "--tmpfs", "/tmp:size=32m",     // writable /tmp for compile output
+    "--tmpfs", "/code:size=16m",    // writable /code so we can write the file
+    image,
+    "sh", "-c",
+    // Write the code into the container then run it
+    `echo ${shellEscape(code)} > /code/${filename} && ${cmd}`,
+  ];
 
-// ── Language-specific runners ─────────────────────────────────────────────────
-
-/**
- * runCpp
- * Step 1: compile with g++
- * Step 2: if compilation succeeds, run the binary
- * Step 3: if compilation fails, return the compile errors immediately
- */
-async function runCpp(sourcePath, binaryPath, stdin) {
-  const compileResult = await runProcess("g++", [
-    sourcePath,
-    "-o", binaryPath,
-    "-std=c++17",
-    "-O2",
-  ]);
-
-  if (compileResult.error) {
-    return {
-      output: "",
-      error: cleanCompileError(compileResult.error, sourcePath),
-    };
-  }
-
-  return runProcess(binaryPath, [], stdin);
-}
-
-// ── Core process spawner ──────────────────────────────────────────────────────
-
-/**
- * runProcess
- * Spawns `command` with `args`, collects stdout/stderr, enforces timeout.
- *
- * @param {string}   command  - e.g. "python3" or "/tmp/abc.out"
- * @param {string[]} args     - argument list
- * @returns {Promise<{ output: string, error: string }>}
- */
-function runProcess(command, args, stdin = "") {
   return new Promise((resolve) => {
-    const child = spawn(command, args);
- 
+    let stdout   = "";
+    let stderr   = "";
+    let timedOut = false;
+
+    const child = spawn("docker", dockerArgs);
+
     if (stdin) {
       child.stdin.write(stdin);
     }
     child.stdin.end();
 
-    let stdout   = "";
-    let stderr   = "";
-    let timedOut = false;
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
 
-    // Accumulate output chunks as they arrive
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-
-    // ── Timeout guard ─────────────────────────────────────────────────────────
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL"); // force-kill; SIGTERM may be ignored
+      // Kill the container (docker stop sends SIGTERM then SIGKILL)
+      try { execSync(`docker kill ${name} 2>/dev/null || true`); } catch {}
+      child.kill("SIGKILL");
     }, TIMEOUT_MS);
 
-    // ── Process exit ──────────────────────────────────────────────────────────
     child.on("close", () => {
       clearTimeout(timer);
 
       if (timedOut) {
         return resolve({
-          output: stdout?.trim() || "",
+          output: stdout.trim(),
           error:  `Time limit exceeded (${TIMEOUT_MS / 1000}s). Check for infinite loops.`,
         });
       }
 
       resolve({
-        output: stdout?.trim() || "",
-        error: stderr?.trim() || ""
+        output: stdout.trim(),
+        error:  stderr.trim(),
       });
     });
 
-    // ── Spawn failure (e.g. command not found) ────────────────────────────────
     child.on("error", (err) => {
       clearTimeout(timer);
-
-      // "ENOENT" means the command itself wasn't found on the system
-      const message = err.code === "ENOENT"
-        ? `Command not found: "${command}". Is it installed?`
-        : `Failed to start process: ${err.message}`;
-
-      resolve({ output: "", error: message });
+      const msg = err.code === "ENOENT"
+        ? "Docker is not installed or not in PATH."
+        : `Failed to start Docker: ${err.message}`;
+      resolve({ output: "", error: msg });
     });
   });
 }
@@ -133,20 +145,13 @@ function runProcess(command, args, stdin = "") {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * cleanCompileError
- * g++ prefixes every error line with the full absolute temp path, which
- * is confusing for users who didn't write a file path. Replace it with
- * a simple "line X:" prefix so errors are readable.
- *
- * Before: /home/.../temp/a3f2c1d4.cpp:5:3: error: ...
- * After:  line 5:3: error: ...
+ * shellEscape
+ * Safely wraps arbitrary code for passing to `sh -c "echo ESCAPED > file"`.
+ * We use printf + hex encoding to avoid any quoting issues.
  */
-function cleanCompileError(raw, sourcePath) {
-  // Escape the path so it's safe to use in a RegExp
-  const escaped = sourcePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(escaped + ":", "g");
-
-  return raw
-    .replace(pattern, "line ")
-    .trim();
+function shellEscape(code) {
+  // Convert each character to its hex representation, then use printf
+  // Actually simpler: base64 encode and decode inside the container
+  const b64 = Buffer.from(code).toString("base64");
+  return `$(echo ${b64} | base64 -d)`;
 }

@@ -2,16 +2,17 @@ import "dotenv/config";
 import express from "express";
 import cors    from "cors";
 import runRouter from "./routes/run.js";
+import aiRouter from "./routes/ai.js";
 
 const app = express();
-
+console.log("API KEY:", process.env.GROQ_API_KEY);
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "256kb" }));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/api", runRouter);
-
+app.use("/api", aiRouter);
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
